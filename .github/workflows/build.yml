@@ -15,9 +15,6 @@ on:
       resukisu_ref:
         description: "ReSukiSU branch/tag (a wrong name silently stays on default)"
         default: "main"
-      disable_lto_cfi:
-        description: "Disable LTO+CFI (much faster, safer with hooks)"
-        default: "true"
       stock_boot_url:
         description: "Optional direct URL to your current boot.img (or commit it as stock/boot.img). Needed for the fastboot boot.img"
         default: ""
@@ -75,25 +72,31 @@ jobs:
         run: |
           A=arch/arm64/configs/vendor/ext_config
           ARGS="O=out ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-"
-          make $ARGS ${{ inputs.defconfig }}
-          FR="$A/moto-bengal.config"
-          [ -f "$A/${{ inputs.device }}-default.config" ] && FR="$FR $A/${{ inputs.device }}-default.config"
-          FR="$FR $(ls configs/*.config 2>/dev/null | tr '\n' ' ')"
-          scripts/kconfig/merge_config.sh -m -O out out/.config $FR
-          scripts/config --file out/.config -e MODULES -e OVERLAY_FS -e KSU
-          if [ "${{ inputs.hook_mode }}" = "kprobes" ]; then
-            scripts/config --file out/.config -e KPROBES -e KPROBE_EVENTS
+          # Keep the version string identical to stock (no "+" from a dirty git tree),
+          # otherwise prebuilt vendor modules refuse to load (vermagic mismatch).
+          : > .scmversion
+          if [ -f stock/config.gz ]; then
+            echo "Using stock/config.gz as the base config"
+            mkdir -p out && zcat stock/config.gz > out/.config
           else
-            scripts/config --file out/.config -d KPROBES -e KSU_MANUAL_HOOK \
+            make $ARGS ${{ inputs.defconfig }}
+            FR="$A/moto-bengal.config"
+            [ -f "$A/${{ inputs.device }}-default.config" ] && FR="$FR $A/${{ inputs.device }}-default.config"
+            FR="$FR $(ls configs/*.config 2>/dev/null | tr '\n' ' ')"
+            scripts/kconfig/merge_config.sh -m -O out out/.config $FR
+          fi
+          # ONLY ReSukiSU options below. Everything else stays exactly as stock.
+          if [ "${{ inputs.hook_mode }}" = "kprobes" ]; then
+            scripts/config --file out/.config -e KSU -e KPROBES -e KPROBE_EVENTS
+          else
+            scripts/config --file out/.config -e KSU -e KSU_MANUAL_HOOK \
               -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
               -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
               -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
           fi
-          if [ "${{ inputs.disable_lto_cfi }}" = "true" ]; then
-            scripts/config --file out/.config -d LTO_CLANG -d CFI_CLANG -d CFI_PERMISSIVE
-          fi
           make $ARGS olddefconfig
-          grep -E "CONFIG_(KSU|KPROBES|LTO_CLANG|CFI_CLANG)=" out/.config || true
+          grep -E "CONFIG_(KSU|KPROBES|LTO_CLANG|CFI_CLANG|MODVERSIONS|LOCALVERSION)" out/.config || true
+          echo "kernelrelease: $(make $ARGS -s kernelrelease)"
 
       - name: Build
         run: |
