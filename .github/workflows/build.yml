@@ -1,0 +1,110 @@
+name: Build kernel (sm6225 + ReSukiSU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Device codename"
+        default: "guamna"
+      defconfig:
+        description: "Base defconfig"
+        default: "vendor/bengal-perf_defconfig"
+      hook_mode:
+        description: "ReSukiSU hook mode: kprobes or manual"
+        default: "manual"
+      resukisu_ref:
+        description: "ReSukiSU branch/tag (a wrong name silently stays on default)"
+        default: "main"
+      disable_lto_cfi:
+        description: "Disable LTO+CFI (much faster, safer with hooks)"
+        default: "true"
+
+env:
+  CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r416183b.tar.gz"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - name: Deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev lz4 zip \
+            cpio python3 curl git gcc-aarch64-linux-gnu
+
+      - name: Toolchain (AOSP clang r416183b, same as build.config.common)
+        run: |
+          mkdir -p $HOME/clang
+          curl -L "$CLANG_URL" | tar -xz -C $HOME/clang
+          echo "$HOME/clang/bin" >> $GITHUB_PATH
+
+      # Drop any *.patch into patches/ in your repo; applied in filename order.
+      - name: Apply patches
+        run: |
+          shopt -s nullglob
+          for p in patches/*.patch; do
+            echo ">> $p"
+            if git apply --check "$p" 2>/dev/null; then git apply "$p"
+            else patch -p1 --no-backup-if-mismatch < "$p" || { echo "FAILED: $p"; exit 1; }
+            fi
+          done
+
+      - name: Add ReSukiSU
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" \
+            | bash -s "${{ inputs.resukisu_ref }}"
+          git -C KernelSU branch --show-current || true
+          ls drivers/kernelsu 2>/dev/null | head -3
+
+      - name: Configure
+        run: |
+          A=arch/arm64/configs/vendor/ext_config
+          ARGS="O=out ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-"
+          make $ARGS ${{ inputs.defconfig }}
+          # Moto fragments, same set defconfig.mk uses
+          FR="$A/moto-bengal.config"
+          [ -f "$A/${{ inputs.device }}-default.config" ] && FR="$FR $A/${{ inputs.device }}-default.config"
+          # Your own fragments: configs/*.config in your repo
+          FR="$FR $(ls configs/*.config 2>/dev/null | tr '\n' ' ')"
+          scripts/kconfig/merge_config.sh -m -O out out/.config $FR
+          scripts/config --file out/.config -e MODULES -e OVERLAY_FS -e KSU
+          if [ "${{ inputs.hook_mode }}" = "kprobes" ]; then
+            scripts/config --file out/.config -e KPROBES -e KPROBE_EVENTS
+          else
+            # manual hooks come from patches/001-resukisu-manual-hooks.patch
+            scripts/config --file out/.config -d KPROBES -e KSU_MANUAL_HOOK \
+              -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
+              -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+              -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
+          fi
+          if [ "${{ inputs.disable_lto_cfi }}" = "true" ]; then
+            scripts/config --file out/.config -d LTO_CLANG -d CFI_CLANG -d CFI_PERMISSIVE
+          fi
+          make $ARGS olddefconfig
+          grep -E "CONFIG_(KSU|KPROBES|LTO_CLANG|CFI_CLANG)=" out/.config || true
+
+      - name: Build
+        run: |
+          make O=out ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- \
+            -j$(nproc) Image.gz dtbs 2>&1 | tee build.log
+          find out/arch/arm64/boot -maxdepth 1 -name 'Image*'
+
+      - name: Package
+        run: |
+          mkdir -p dist/dtbs
+          cp out/arch/arm64/boot/Image* dist/
+          find out/arch/arm64/boot/dts -name '*.dtb*' -exec cp {} dist/dtbs/ \;
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3 ak3
+          cp out/arch/arm64/boot/Image.gz ak3/
+          (cd ak3 && rm -rf .git && zip -r9 ../dist/AnyKernel3.zip .)
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-${{ inputs.device }}
+          path: |
+            dist/
+            build.log
