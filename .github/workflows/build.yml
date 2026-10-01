@@ -18,6 +18,16 @@ on:
       disable_lto_cfi:
         description: "Disable LTO+CFI (much faster, safer with hooks)"
         default: "true"
+      stock_boot_url:
+        description: "Optional direct URL to your current boot.img (or commit it as stock/boot.img). Needed for the fastboot boot.img"
+        default: ""
+      release:
+        description: "Publish a GitHub release with the outputs"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
 
 env:
   CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/bd96dfe349c962681f0e5388af874c771ef96670/clang-r416183b.tar.gz"
@@ -66,17 +76,14 @@ jobs:
           A=arch/arm64/configs/vendor/ext_config
           ARGS="O=out ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-"
           make $ARGS ${{ inputs.defconfig }}
-          # Moto fragments, same set defconfig.mk uses
           FR="$A/moto-bengal.config"
           [ -f "$A/${{ inputs.device }}-default.config" ] && FR="$FR $A/${{ inputs.device }}-default.config"
-          # Your own fragments: configs/*.config in your repo
           FR="$FR $(ls configs/*.config 2>/dev/null | tr '\n' ' ')"
           scripts/kconfig/merge_config.sh -m -O out out/.config $FR
           scripts/config --file out/.config -e MODULES -e OVERLAY_FS -e KSU
           if [ "${{ inputs.hook_mode }}" = "kprobes" ]; then
             scripts/config --file out/.config -e KPROBES -e KPROBE_EVENTS
           else
-            # manual hooks come from patches/001-resukisu-manual-hooks.patch
             scripts/config --file out/.config -d KPROBES -e KSU_MANUAL_HOOK \
               -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
               -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
@@ -94,14 +101,56 @@ jobs:
             -j$(nproc) Image.gz dtbs 2>&1 | tee build.log
           find out/arch/arm64/boot -maxdepth 1 -name 'Image*'
 
-      - name: Package
+      - name: Package (AnyKernel3 for recovery)
         run: |
-          mkdir -p dist/dtbs
-          cp out/arch/arm64/boot/Image* dist/
-          find out/arch/arm64/boot/dts -name '*.dtb*' -exec cp {} dist/dtbs/ \;
+          mkdir -p dist
+          cp out/arch/arm64/boot/Image.gz dist/
           git clone --depth 1 https://github.com/osm0sis/AnyKernel3 ak3
-          cp out/arch/arm64/boot/Image.gz ak3/
-          (cd ak3 && rm -rf .git && zip -r9 ../dist/AnyKernel3.zip .)
+          cd ak3 && rm -rf .git examples modules patch ramdisk/* 2>/dev/null; mkdir -p ramdisk patch modules
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=ReSukiSU kernel for guamna
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=guamna
+          device.name2=guamna_retail
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+          cp ../out/arch/arm64/boot/Image.gz .
+          zip -r9 ../dist/AnyKernel3-${{ inputs.device }}-run${{ github.run_number }}.zip . -x '.git*'
+
+      # Optional: repack YOUR stock boot.img with the new kernel (keeps ramdisk, dtb, cmdline)
+      - name: Build boot.img for fastboot (optional)
+        run: |
+          if [ -f stock/boot.img ]; then cp stock/boot.img stock_boot.img
+          elif [ -n "${{ inputs.stock_boot_url }}" ]; then curl -fL -o stock_boot.img "${{ inputs.stock_boot_url }}"
+          else echo "No stock boot.img provided, skipping boot.img"; exit 0; fi
+          mkdir mkb
+          curl -fL "https://android.googlesource.com/platform/system/tools/mkbootimg/+archive/refs/heads/main.tar.gz" | tar -xz -C mkb
+          python3 mkb/unpack_bootimg.py --boot_img stock_boot.img --out bi --format=mkbootimg > mkargs.txt
+          cat mkargs.txt
+          grep -q -- '--dtb' mkargs.txt || { echo "Stock boot has no separate dtb (appended-dtb layout). Not supported, use the AnyKernel3 zip."; exit 1; }
+          if file bi/kernel | grep -qi gzip; then K=out/arch/arm64/boot/Image.gz; else K=out/arch/arm64/boot/Image; fi
+          sed -i "s|--kernel [^ ]*|--kernel $K|" mkargs.txt
+          eval python3 mkb/mkbootimg.py $(cat mkargs.txt) -o dist/boot.img
+          ls -l dist/boot.img
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -110,4 +159,18 @@ jobs:
           path: |
             dist/
             build.log
+
+      - name: GitHub release
+        if: ${{ inputs.release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.device }}-run${{ github.run_number }}
+          name: ${{ inputs.device }} ReSukiSU kernel #${{ github.run_number }}
+          body: |
+            Hook mode: ${{ inputs.hook_mode }}, ReSukiSU ref: ${{ inputs.resukisu_ref }}, commit ${{ github.sha }}
+            Flash AnyKernel3 zip in recovery, or `fastboot boot boot.img` to test first.
+          files: |
+            dist/AnyKernel3-*.zip
+            dist/boot.img
+            dist/Image.gz
             
