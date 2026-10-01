@@ -20,7 +20,7 @@ on:
         default: "true"
 
 env:
-  CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r416183b.tar.gz"
+  CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/bd96dfe349c962681f0e5388af874c771ef96670/clang-r416183b.tar.gz"
 
 jobs:
   build:
@@ -38,7 +38,9 @@ jobs:
       - name: Toolchain (AOSP clang r416183b, same as build.config.common)
         run: |
           mkdir -p $HOME/clang
-          curl -L "$CLANG_URL" | tar -xz -C $HOME/clang
+          curl -fL --retry 3 -o clang.tgz "$CLANG_URL"
+          tar -xzf clang.tgz -C $HOME/clang
+          $HOME/clang/bin/clang --version | head -1
           echo "$HOME/clang/bin" >> $GITHUB_PATH
 
       # Drop any *.patch into patches/ in your repo; applied in filename order.
@@ -108,3 +110,4 @@ jobs:
           path: |
             dist/
             build.log
+            
