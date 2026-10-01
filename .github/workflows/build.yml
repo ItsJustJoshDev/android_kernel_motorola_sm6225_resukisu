@@ -26,8 +26,6 @@ on:
 permissions:
   contents: write
 
-env:
-  CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/bd96dfe349c962681f0e5388af874c771ef96670/clang-r416183b.tar.gz"
 
 jobs:
   build:
@@ -44,9 +42,13 @@ jobs:
 
       - name: Toolchain (AOSP clang r416183b, same as build.config.common)
         run: |
-          mkdir -p $HOME/clang
-          curl -fL --retry 3 -o clang.tgz "$CLANG_URL"
-          tar -xzf clang.tgz -C $HOME/clang
+          # LineageOS's own kernel-clang mirror (same r416183b the ROM build uses)
+          for i in 1 2 3; do
+            git clone --depth 1 -b lineage-20.0 \
+              https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b \
+              $HOME/clang && break
+            echo "clone failed, retry $i"; rm -rf $HOME/clang; sleep 5
+          done
           $HOME/clang/bin/clang --version | head -1
           echo "$HOME/clang/bin" >> $GITHUB_PATH
 
@@ -145,8 +147,7 @@ jobs:
           if [ -f stock/boot.img ]; then cp stock/boot.img stock_boot.img
           elif [ -n "${{ inputs.stock_boot_url }}" ]; then curl -fL -o stock_boot.img "${{ inputs.stock_boot_url }}"
           else echo "No stock boot.img provided, skipping boot.img"; exit 0; fi
-          mkdir mkb
-          curl -fL "https://android.googlesource.com/platform/system/tools/mkbootimg/+archive/refs/heads/main.tar.gz" | tar -xz -C mkb
+          git clone --depth 1 https://github.com/LineageOS/android_system_tools_mkbootimg mkb
           python3 mkb/unpack_bootimg.py --boot_img stock_boot.img --out bi --format=mkbootimg > mkargs.txt
           cat mkargs.txt
           grep -q -- '--dtb' mkargs.txt || { echo "Stock boot has no separate dtb (appended-dtb layout). Not supported, use the AnyKernel3 zip."; exit 1; }
